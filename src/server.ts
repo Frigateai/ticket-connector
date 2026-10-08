@@ -2,10 +2,16 @@ import express from "express";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
+import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
+import { LocalOAuthProvider } from "./oauth.js";
 import { plane, rows, paths, listProjects, resolveProject, resolveState, getIssueByRef, WORKSPACE } from "./plane.js";
 
 const PORT = Number(process.env.PORT ?? 3000);
-const MCP_TOKEN = process.env.MCP_AUTH_TOKEN ?? "";
+const SERVER_URL = (process.env.SERVER_URL ?? "").replace(/\/$/, ""); // public URL of this connector
+const LOGIN_PASSWORD = process.env.OAUTH_LOGIN_PASSWORD ?? "";
+const STATIC_TOKEN = process.env.MCP_AUTH_TOKEN ?? ""; // optional, for curl/testing
+const DATA_DIR = process.env.DATA_DIR ?? "./data";
 const PUBLIC_URL = (process.env.PLANE_BASE_URL ?? "https://ticket.frigate.ai").replace(/\/$/, "");
 const { ws } = paths;
 
@@ -266,23 +272,36 @@ function buildServer() {
   return s;
 }
 
-if (!process.env.PLANE_API_KEY || !WORKSPACE) {
-  console.error("PLANE_API_KEY and PLANE_WORKSPACE_SLUG are required");
+if (!process.env.PLANE_API_KEY || !WORKSPACE || !SERVER_URL || !LOGIN_PASSWORD) {
+  console.error("PLANE_API_KEY, PLANE_WORKSPACE_SLUG, SERVER_URL and OAUTH_LOGIN_PASSWORD are required");
   process.exit(1);
 }
 
+const provider = new LocalOAuthProvider(DATA_DIR, LOGIN_PASSWORD, STATIC_TOKEN);
+const issuerUrl = new URL(SERVER_URL);
+const mcpUrl = new URL("/mcp", issuerUrl);
+
 const app = express();
+app.set("trust proxy", 1); // behind the reverse proxy; needed for rate limiting
 app.use(express.json({ limit: "1mb" }));
 
 app.get("/healthz", (_req, res) => void res.json({ ok: true }));
 
-app.use("/mcp", (req, res, next) => {
-  if (MCP_TOKEN && req.header("authorization") !== `Bearer ${MCP_TOKEN}`) {
-    res.status(401).json({ error: "unauthorized" });
-    return;
-  }
-  next();
-});
+// OAuth discovery, dynamic client registration, /authorize, /token, /revoke.
+app.use(
+  mcpAuthRouter({
+    provider,
+    issuerUrl,
+    resourceServerUrl: mcpUrl,
+    resourceName: "Plane (ticket.frigate.ai)",
+  }),
+);
+app.post("/oauth/login", express.urlencoded({ extended: false }), provider.handleLogin);
+
+app.use(
+  "/mcp",
+  requireBearerAuth({ verifier: provider, resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(mcpUrl) }),
+);
 
 // Stateless Streamable HTTP: a fresh server + transport per request.
 app.post("/mcp", async (req, res) => {
